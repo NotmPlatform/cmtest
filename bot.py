@@ -17,24 +17,29 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
 # Перед запуском задайте:
 # export BOT_TOKEN="ВАШ_ТОКЕН"
-# export ADMIN_CHAT_ID="123456789"   # опционально
-# export PASS_SCORE="12"             # опционально
-# export QUESTIONS_PER_TEST="15"     # опционально
+# export ADMIN_CHAT_ID="-1001234567890"   # ID закрытой группы / чата для результатов
+# export PASS_SCORE="12"                  # опционально
+# export QUESTIONS_PER_TEST="15"          # опционально
+#
+# Логика сертификата:
+# 1) После успешной сдачи бот отправляет результат в ADMIN_CHAT_ID
+# 2) Админ отвечает НА ЭТО СООБЩЕНИЕ pdf-файлом сертификата
+# 3) Бот отправляет этот PDF пользователю, чей результат был в сообщении
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
-
 PASS_SCORE = int(os.getenv("PASS_SCORE", "12"))
 QUESTIONS_PER_TEST = int(os.getenv("QUESTIONS_PER_TEST", "15"))
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_FILE = BASE_DIR / "quiz_results.csv"
 ATTEMPTS_FILE = BASE_DIR / "attempts.json"
+ADMIN_LINKS_FILE = BASE_DIR / "admin_message_links.json"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -44,7 +49,11 @@ logger = logging.getLogger(__name__)
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z\s\-']{1,58}[A-Za-z]$|^[A-Za-z]{2,60}$")
 LINKEDIN_RE = re.compile(r"^https?://(www\.)?linkedin\.com/.*$", re.IGNORECASE)
+LETTERS = ["A", "B", "C", "D"]
 
+# =========================================================
+# QUESTION BANK (50)
+# =========================================================
 QUESTION_BANK = [
     {"q": "Что в Web3 CM делает в первую очередь: просто отвечает в чате или управляет доверием?", "options": ["Просто отвечает на сообщения", "Управляет доверием и атмосферой среды", "Заменяет support", "Отвечает только по скрипту"], "correct": 1},
     {"q": "Почему обычные CM часто проваливаются в Web3?", "options": ["Потому что мало пишут сообщений", "Потому что Web3 требует скорости, ясности и понимания риска ошибок", "Потому что им не дают доступ в чат", "Потому что не умеют делать мемы"], "correct": 1},
@@ -98,45 +107,59 @@ QUESTION_BANK = [
     {"q": "Что лучше описывает итог сильного курса для CM?", "options": ["Человек знает много терминов, но не умеет применять", "Человек мыслит как специалист и может войти в роль", "Человек умеет только читать посты", "Человек знает только названия бирж"], "correct": 1},
 ]
 
+# =========================================================
+# FILE HELPERS
+# =========================================================
 def ensure_results_file():
     if not RESULTS_FILE.exists():
         with RESULTS_FILE.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "telegram_id", "username", "full_name_latin", "linkedin", "score", "total", "passed"])
+            writer.writerow(
+                [
+                    "timestamp",
+                    "telegram_id",
+                    "username",
+                    "full_name_latin",
+                    "linkedin",
+                    "score",
+                    "total",
+                    "passed",
+                ]
+            )
 
-def load_attempts():
-    if not ATTEMPTS_FILE.exists():
+def load_json_file(path: Path) -> dict:
+    if not path.exists():
         return {}
     try:
-        with ATTEMPTS_FILE.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        logger.warning("Could not load attempts.json: %s", e)
+        logger.warning("Could not load %s: %s", path.name, e)
         return {}
 
-def save_attempts(data):
-    with ATTEMPTS_FILE.open("w", encoding="utf-8") as f:
+def save_json_file(path: Path, data: dict) -> None:
+    with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_user_attempt(user_id):
-    attempts = load_attempts()
+def get_user_attempt(user_id: int) -> dict:
+    attempts = load_json_file(ATTEMPTS_FILE)
     return attempts.get(str(user_id), {})
 
-def set_next_allowed_date(user_id, next_date):
-    attempts = load_attempts()
+def set_next_allowed_date(user_id: int, next_date: date) -> None:
+    attempts = load_json_file(ATTEMPTS_FILE)
     key = str(user_id)
     attempts[key] = attempts.get(key, {})
     attempts[key]["next_allowed_date"] = next_date.isoformat()
-    save_attempts(attempts)
+    save_json_file(ATTEMPTS_FILE, attempts)
 
-def clear_next_allowed_date(user_id):
-    attempts = load_attempts()
+def clear_next_allowed_date(user_id: int) -> None:
+    attempts = load_json_file(ATTEMPTS_FILE)
     key = str(user_id)
     if key in attempts and "next_allowed_date" in attempts[key]:
         attempts[key].pop("next_allowed_date", None)
-        save_attempts(attempts)
+        save_json_file(ATTEMPTS_FILE, attempts)
 
-def can_start_test(user_id):
+def can_start_test(user_id: int):
     attempt = get_user_attempt(user_id)
     next_allowed = attempt.get("next_allowed_date")
     if not next_allowed:
@@ -150,52 +173,113 @@ def can_start_test(user_id):
         return False, f"Сегодня повторная попытка недоступна.\nПопробуйте снова {next_allowed_date.strftime('%d.%m.%Y')}."
     return True, ""
 
+def save_admin_message_link(admin_message_id: int, payload: dict) -> None:
+    links = load_json_file(ADMIN_LINKS_FILE)
+    links[str(admin_message_id)] = payload
+    save_json_file(ADMIN_LINKS_FILE, links)
+
+def get_admin_message_link(admin_message_id: int) -> dict | None:
+    links = load_json_file(ADMIN_LINKS_FILE)
+    return links.get(str(admin_message_id))
+
+# =========================================================
+# QUIZ HELPERS
+# =========================================================
 def main_menu_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Начать тест", callback_data="start_quiz")]])
 
-def build_question_keyboard(question_index, options):
-    rows = []
-    for i, option in enumerate(options):
-        rows.append([InlineKeyboardButton(option, callback_data=f"ans|{question_index}|{i}")])
-    return InlineKeyboardMarkup(rows)
+def build_question_keyboard(question_index: int):
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("A", callback_data=f"ans|{question_index}|0"),
+            InlineKeyboardButton("B", callback_data=f"ans|{question_index}|1"),
+            InlineKeyboardButton("C", callback_data=f"ans|{question_index}|2"),
+            InlineKeyboardButton("D", callback_data=f"ans|{question_index}|3"),
+        ]]
+    )
 
-def format_question(q_index, total, question):
-    return f"Вопрос {q_index + 1} из {total}\n\n{question['q']}"
+def format_question(q_index: int, total: int, question: dict) -> str:
+    options_text = "\n".join([f"{LETTERS[i]}. {option}" for i, option in enumerate(question["options"])])
+    return f"Вопрос {q_index + 1} из {total}\n\n{question['q']}\n\n{options_text}"
 
-async def send_question(chat_id, context):
+async def render_question_message(query_or_message, context: ContextTypes.DEFAULT_TYPE):
     session = context.user_data.get("quiz_session")
     if not session:
         return
+
     idx = session["current"]
     total = len(session["questions"])
     question = session["questions"][idx]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=format_question(idx, total, question),
-        reply_markup=build_question_keyboard(idx, question["options"]),
-    )
+    text = format_question(idx, total, question)
+    keyboard = build_question_keyboard(idx)
 
-def reset_quiz(context):
+    message_id = session.get("message_id")
+    chat_id = session.get("chat_id")
+
+    if message_id and chat_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception as e:
+            logger.warning("Could not edit question message: %s", e)
+
+    sent = await query_or_message.message.reply_text(text, reply_markup=keyboard) if hasattr(query_or_message, "message") else await query_or_message.reply_text(text, reply_markup=keyboard)
+    session["message_id"] = sent.message_id
+    session["chat_id"] = sent.chat_id
+    context.user_data["quiz_session"] = session
+
+def reset_quiz(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("quiz_session", None)
     context.user_data.pop("stage", None)
     context.user_data.pop("full_name_latin", None)
 
-async def notify_admin_if_needed(context, user_id, username, full_name, linkedin, score, total):
+async def send_result_to_admin_group(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    username: str | None,
+    full_name: str,
+    linkedin: str,
+    score: int,
+    total: int,
+):
     if not ADMIN_CHAT_ID:
         return
+
     text = (
-        "✅ Новый успешный кандидат\n\n"
+        "✅ Новый успешно сданный тест\n\n"
         f"Telegram ID: {user_id}\n"
         f"Username: @{username if username else '—'}\n"
         f"Имя: {full_name}\n"
         f"LinkedIn: {linkedin}\n"
-        f"Результат: {score}/{total}"
+        f"Результат: {score}/{total}\n\n"
+        "Чтобы отправить сертификат пользователю, ответьте НА ЭТО сообщение PDF-файлом."
     )
-    try:
-        await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=text)
-    except Exception as e:
-        logger.warning("Could not notify admin: %s", e)
 
+    try:
+        sent = await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=text)
+        save_admin_message_link(
+            sent.message_id,
+            {
+                "user_id": user_id,
+                "username": username or "",
+                "full_name_latin": full_name,
+                "linkedin": linkedin,
+                "score": score,
+                "total": total,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+    except Exception as e:
+        logger.warning("Could not send result to admin group: %s", e)
+
+# =========================================================
+# HANDLERS
+# =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     allowed, reason = can_start_test(user.id)
@@ -205,14 +289,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• В тесте будет {QUESTIONS_PER_TEST} случайных вопросов из банка 50\n"
         f"• Для успешной сдачи нужно набрать минимум {PASS_SCORE} правильных ответов\n"
         "• Если тест не пройден, повторная попытка будет доступна завтра\n"
-        "• Если тест пройден, бот попросит имя и фамилию латиницей и ссылку на LinkedIn\n\n"
+        "• Если тест пройден, бот попросит имя и фамилию латиницей и ссылку на LinkedIn\n"
+        "• После успешной сдачи данные уйдут в закрытую группу, откуда админ сможет отправить PDF-сертификат\n\n"
     )
 
     if not allowed:
         await update.message.reply_text(text + reason)
         return
 
-    await update.message.reply_text(text + "Нажмите кнопку ниже, чтобы начать.", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(
+        text + "Нажмите кнопку ниже, чтобы начать.",
+        reply_markup=main_menu_keyboard(),
+    )
 
 async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -225,11 +313,18 @@ async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     questions = random.sample(QUESTION_BANK, QUESTIONS_PER_TEST)
-    context.user_data["quiz_session"] = {"questions": questions, "current": 0, "score": 0, "total": QUESTIONS_PER_TEST}
+    context.user_data["quiz_session"] = {
+        "questions": questions,
+        "current": 0,
+        "score": 0,
+        "total": QUESTIONS_PER_TEST,
+        "message_id": None,
+        "chat_id": query.message.chat_id,
+    }
     context.user_data["stage"] = "quiz"
 
-    await query.message.reply_text("Тест начался.\nВыбирайте один вариант ответа на каждый вопрос.")
-    await send_question(query.message.chat_id, context)
+    await query.message.reply_text("Тест начался.\nВыбирайте вариант A / B / C / D.")
+    await render_question_message(query, context)
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -264,29 +359,32 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session["current"] += 1
     context.user_data["quiz_session"] = session
 
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
     if session["current"] < session["total"]:
-        await send_question(query.message.chat_id, context)
+        await render_question_message(query, context)
         return
 
     score = session["score"]
     total = session["total"]
 
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
     if score >= PASS_SCORE:
         context.user_data["stage"] = "await_name"
         await query.message.reply_text(
-            f"✅ Тест пройден: {score}/{total}\n\nВведите имя и фамилию латиницей.\nПример: Ivan Petrov"
+            f"✅ Тест пройден: {score}/{total}\n\n"
+            "Введите имя и фамилию латиницей.\n"
+            "Пример: Ivan Petrov"
         )
     else:
         tomorrow = date.today() + timedelta(days=1)
         set_next_allowed_date(query.from_user.id, tomorrow)
         reset_quiz(context)
         await query.message.reply_text(
-            f"❌ Тест не пройден: {score}/{total}\n\nПовторная попытка будет доступна завтра: {tomorrow.strftime('%d.%m.%Y')}."
+            f"❌ Тест не пройден: {score}/{total}\n\n"
+            f"Повторная попытка будет доступна завтра: {tomorrow.strftime('%d.%m.%Y')}."
         )
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -294,25 +392,29 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if stage == "quiz":
-        await update.message.reply_text("Во время теста выбирайте ответы кнопками под вопросом.")
+        await update.message.reply_text("Во время теста используйте кнопки A / B / C / D под вопросом.")
         return
 
     if stage == "await_name":
         if not NAME_RE.fullmatch(text):
-            await update.message.reply_text("Введите имя и фамилию только латиницей.\nПример: Ivan Petrov")
+            await update.message.reply_text(
+                "Введите имя и фамилию только латиницей.\nПример: Ivan Petrov"
+            )
             return
 
         context.user_data["full_name_latin"] = text
         context.user_data["stage"] = "await_linkedin"
         await update.message.reply_text(
-            "Отлично. Теперь отправьте ссылку на ваш LinkedIn.\nПример: https://www.linkedin.com/in/your-name/"
+            "Отлично. Теперь отправьте ссылку на ваш LinkedIn.\n"
+            "Пример: https://www.linkedin.com/in/your-name/"
         )
         return
 
     if stage == "await_linkedin":
         if not LINKEDIN_RE.fullmatch(text):
             await update.message.reply_text(
-                "Нужна корректная ссылка на LinkedIn.\nПример: https://www.linkedin.com/in/your-name/"
+                "Нужна корректная ссылка на LinkedIn.\n"
+                "Пример: https://www.linkedin.com/in/your-name/"
             )
             return
 
@@ -325,25 +427,92 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ensure_results_file()
         with RESULTS_FILE.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                user.id,
-                user.username or "",
-                full_name,
-                text,
-                score,
-                total,
-                "yes",
-            ])
+            writer.writerow(
+                [
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    user.id,
+                    user.username or "",
+                    full_name,
+                    text,
+                    score,
+                    total,
+                    "yes",
+                ]
+            )
 
         clear_next_allowed_date(user.id)
-        await notify_admin_if_needed(context, user.id, user.username, full_name, text, score, total)
-        reset_quiz(context)
 
-        await update.message.reply_text("✅ Данные сохранены.\n\nСпасибо! Тест успешно пройден.")
+        await send_result_to_admin_group(
+            context=context,
+            user_id=user.id,
+            username=user.username,
+            full_name=full_name,
+            linkedin=text,
+            score=score,
+            total=total,
+        )
+
+        reset_quiz(context)
+        await update.message.reply_text(
+            "✅ Данные сохранены.\n\n"
+            "Результат отправлен в закрытую группу.\n"
+            "После проверки админ сможет прислать вам PDF-сертификат."
+        )
         return
 
     await update.message.reply_text("Нажмите /start, чтобы открыть тест.")
+
+async def handle_admin_certificate_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+
+    if not ADMIN_CHAT_ID:
+        return
+
+    try:
+        admin_chat_id_int = int(ADMIN_CHAT_ID)
+    except ValueError:
+        logger.warning("ADMIN_CHAT_ID is invalid")
+        return
+
+    if message.chat_id != admin_chat_id_int:
+        return
+
+    if not message.reply_to_message:
+        return
+
+    replied_to_message_id = message.reply_to_message.message_id
+    link_data = get_admin_message_link(replied_to_message_id)
+    if not link_data:
+        return
+
+    document = message.document
+    if not document:
+        return
+
+    is_pdf = (document.mime_type == "application/pdf") or (document.file_name and document.file_name.lower().endswith(".pdf"))
+    if not is_pdf:
+        await message.reply_text("Нужен PDF-файл. Ответьте на сообщение кандидата PDF-документом.")
+        return
+
+    user_id = link_data["user_id"]
+    admin_caption = (message.caption or "").strip()
+
+    caption = "✅ Ваш сертификат готов."
+    if admin_caption:
+        caption += f"\n\n{admin_caption}"
+
+    try:
+        await context.bot.send_document(
+            chat_id=user_id,
+            document=document.file_id,
+            caption=caption,
+        )
+        await message.reply_text("Сертификат успешно отправлен пользователю.")
+    except Exception as e:
+        logger.warning("Could not send certificate to user %s: %s", user_id, e)
+        await message.reply_text("Не удалось отправить сертификат пользователю. Возможно, он не запускал бота или заблокировал его.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_quiz(context)
@@ -360,6 +529,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(start_quiz, pattern=r"^start_quiz$"))
     app.add_handler(CallbackQueryHandler(handle_answer, pattern=r"^ans\|"))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_certificate_reply))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     logger.info("Bot started")

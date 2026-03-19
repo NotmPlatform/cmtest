@@ -2,6 +2,8 @@ import os
 import json
 import sqlite3
 import random
+import re
+from urllib.parse import urlparse
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -112,15 +114,15 @@ ACCESS_DENIED_TEXT = """
 ASK_FULL_NAME_TEXT = """
 Тест завершён.
 
-Теперь введите ваше ФИО:
-например: Иван Иванов
+Please enter your full name in English.
+Example: Ivan Ivanov
 """.strip()
 
 ASK_LINKEDIN_TEXT = """
 Отлично.
 
 Теперь отправьте ссылку на ваш LinkedIn.
-Если LinkedIn нет — напишите: Нет
+Пример: https://www.linkedin.com/in/ivan-ivanov
 """.strip()
 
 FINAL_THANKS_TEXT = """
@@ -1299,10 +1301,26 @@ def get_question(session, index=None):
     return QUESTION_BANK[profession][question_id]
 
 
+def get_option_order(session, index=None):
+    if index is None:
+        index = session["current_index"]
+
+    profession = session["profession"]
+    question_id = session["question_ids"][index]
+    seed = f"{session['user_id']}:{profession}:{question_id}:{index}"
+
+    option_order = [0, 1, 2, 3]
+    rng = random.Random(seed)
+    rng.shuffle(option_order)
+    return option_order
+
+
 def build_question_text(session):
     profession = PROFESSIONS[session["profession"]]["title"]
     index = session["current_index"]
     question = get_question(session, index)
+    option_order = get_option_order(session, index)
+    labels = ["A", "B", "C", "D"]
 
     lines = [
         f"Профессия: {profession}",
@@ -1310,24 +1328,25 @@ def build_question_text(session):
         "",
         question["question"],
         "",
-        f"A. {question['options'][0]}",
-        f"B. {question['options'][1]}",
-        f"C. {question['options'][2]}",
-        f"D. {question['options'][3]}",
     ]
+
+    for label, option_index in zip(labels, option_order):
+        lines.append(f"{label}. {question['options'][option_index]}")
+
     return "\n".join(lines)
 
 
 def build_question_keyboard(session):
     index = session["current_index"]
+    option_order = get_option_order(session, index)
     rows = [
         [
-            InlineKeyboardButton("A", callback_data=f"answer:{index}:0"),
-            InlineKeyboardButton("B", callback_data=f"answer:{index}:1"),
+            InlineKeyboardButton("A", callback_data=f"answer:{index}:{option_order[0]}"),
+            InlineKeyboardButton("B", callback_data=f"answer:{index}:{option_order[1]}"),
         ],
         [
-            InlineKeyboardButton("C", callback_data=f"answer:{index}:2"),
-            InlineKeyboardButton("D", callback_data=f"answer:{index}:3"),
+            InlineKeyboardButton("C", callback_data=f"answer:{index}:{option_order[2]}"),
+            InlineKeyboardButton("D", callback_data=f"answer:{index}:{option_order[3]}"),
         ],
     ]
 
@@ -1354,15 +1373,50 @@ async def check_membership(bot, user_id, chat_id):
         return False, str(e)
 
 
+def normalize_full_name(text):
+    raw = " ".join(text.strip().split())
+
+    if len(raw) < 5 or " " not in raw:
+        return None
+
+    if not re.fullmatch(r"[A-Za-z][A-Za-z'\- ]+[A-Za-z]", raw):
+        return None
+
+    parts = [part for part in raw.split(" ") if part]
+    if len(parts) < 2:
+        return None
+
+    return raw
+
+
 def normalize_linkedin(text):
     raw = text.strip()
-    if raw.lower() in {"нет", "no", "-", "none"}:
-        return "Нет"
-    if "linkedin.com" in raw.lower():
-        if raw.startswith("http://") or raw.startswith("https://"):
-            return raw
-        return "https://" + raw
-    return None
+    if not raw:
+        return None
+
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host != "linkedin.com":
+        return None
+
+    path = parsed.path.rstrip("/")
+    if not re.fullmatch(r"/(in|pub)/[A-Za-z0-9_%\-]+", path):
+        return None
+
+    return f"https://www.linkedin.com{path}"
 
 
 def build_resume_text(session):
@@ -1661,23 +1715,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if session["state"] == "awaiting_full_name":
-        if len(text) < 4:
-            await update.message.reply_text("Пожалуйста, введите корректное ФИО.")
+        full_name_value = normalize_full_name(text)
+        if full_name_value is None:
+            await update.message.reply_text(
+                "Пожалуйста, введите ваше ФИО только на английском языке.\n"
+                "Пример: Ivan Ivanov"
+            )
             return
 
-        update_session_from_user(user, full_name=text, state="awaiting_linkedin")
-        save_action(user, "Указал ФИО")
+        update_session_from_user(user, full_name=full_name_value, state="awaiting_linkedin")
+        save_action(user, "Указал ФИО на английском")
         await update.message.reply_text(ASK_LINKEDIN_TEXT)
         return
 
     if session["state"] == "awaiting_linkedin":
         linkedin_value = normalize_linkedin(text)
         if linkedin_value is None:
-            await update.message.reply_text("Пожалуйста, отправьте ссылку на LinkedIn или напишите: Нет")
+            await update.message.reply_text(
+                "Пожалуйста, отправьте корректную ссылку на LinkedIn.\n"
+                "Пример: https://www.linkedin.com/in/ivan-ivanov"
+            )
             return
 
         update_session_from_user(user, linkedin_url=linkedin_value, state="finished")
-        save_action(user, "Указал LinkedIn")
+        save_action(user, "Указал ссылку LinkedIn")
         await finalize_result(update, context)
         return
 

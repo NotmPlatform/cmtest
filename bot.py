@@ -1595,33 +1595,66 @@ def download_certificate_template_bytes():
 
 
 def create_certificate_overlay(full_name, course_title, date_issued, page_width, page_height):
+    """
+    Накладывает данные сертификата точно по полям шаблона.
+    Текст ставится аккуратно НАД линиями, а не в случайной точке страницы.
+    При необходимости дальше можно подправить только эти координаты.
+    """
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(float(page_width), float(page_height)))
 
     name_font = "Times-Italic"
     course_font = "Helvetica-Bold"
     date_font = "Helvetica-Bold"
+
     brand_r, brand_g, brand_b = (0.10, 0.20, 0.42)
     c.setFillColorRGB(brand_r, brand_g, brand_b)
 
     center_x = float(page_width) / 2
 
-    # ФИО
+    # =========================================================
+    # Координаты полей в PDF-шаблоне Certificate.pdf
+    # Значения подобраны под текущий шаблон 2026UP.
+    # =========================================================
+
+    # Линия под ФИО
+    name_line_y = 302
+    name_center_x = center_x
     name_max_width = 470
+
+    # Линия под названием курса / профессией
+    course_line_y = 202
+    course_center_x = center_x
+    course_max_width = 430
+
+    # Линия под датой
+    date_line_y = 116
+    date_line_left_x = 80
+    date_line_right_x = 252
+    date_center_x = (date_line_left_x + date_line_right_x) / 2
+    date_max_width = 150
+
+    # =========================================================
+    # ФИО — крупно, по центру, аккуратно над своей линией
+    # =========================================================
     name_size = fit_font_size(full_name, name_font, name_max_width, 32, 20)
     c.setFont(name_font, name_size)
-    c.drawCentredString(center_x, 288, full_name)
+    # line_y + 8 дает красивое положение: текст стоит над линией, а не залезает на неё
+    c.drawCentredString(name_center_x, name_line_y + 8, full_name)
 
-    # Профессия / курс (на английском)
-    course_max_width = 430
+    # =========================================================
+    # Название курса / профессия — по центру и над своей линией
+    # =========================================================
     course_size = fit_font_size(course_title, course_font, course_max_width, 22, 12)
     c.setFont(course_font, course_size)
-    c.drawCentredString(center_x, 178, course_title)
+    c.drawCentredString(course_center_x, course_line_y + 8, course_title)
 
-    # Дата выдачи
-    date_size = fit_font_size(date_issued, date_font, 155, 16, 10)
+    # =========================================================
+    # Дата — строго по центру поля даты
+    # =========================================================
+    date_size = fit_font_size(date_issued, date_font, date_max_width, 16, 10)
     c.setFont(date_font, date_size)
-    c.drawString(78, 108, date_issued)
+    c.drawCentredString(date_center_x, date_line_y + 8, date_issued)
 
     c.save()
     packet.seek(0)

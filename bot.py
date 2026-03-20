@@ -1383,7 +1383,6 @@ def get_access_keyboard(profession_key):
 
 def get_after_finish_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Получить сертификат ещё раз", callback_data="send_my_certificate")],
         [InlineKeyboardButton("Пройти ещё один тест", callback_data="restart_test")],
         [InlineKeyboardButton("Написать менеджеру", url=MANAGER_URL)],
     ])
@@ -1557,7 +1556,10 @@ def format_certificate_date(dt=None):
 
 
 def get_certificate_course_title(profession_key):
-    return CERTIFICATE_COURSE_TITLES.get(profession_key, PROFESSIONS.get(profession_key, {}).get("title", "Web3 Course"))
+    return CERTIFICATE_COURSE_TITLES.get(
+        profession_key,
+        PROFESSIONS.get(profession_key, {}).get("title", "Web3 Course"),
+    )
 
 
 def fit_font_size(text, font_name, max_width, max_size, min_size):
@@ -1610,13 +1612,13 @@ def create_certificate_overlay(full_name, course_title, date_issued, page_width,
     c.setFont(name_font, name_size)
     c.drawCentredString(center_x, 288, full_name)
 
-    # Профессия / курс
+    # Профессия / курс (на английском)
     course_max_width = 430
     course_size = fit_font_size(course_title, course_font, course_max_width, 22, 12)
     c.setFont(course_font, course_size)
     c.drawCentredString(center_x, 178, course_title)
 
-    # Дата
+    # Дата выдачи
     date_size = fit_font_size(date_issued, date_font, 155, 16, 10)
     c.setFont(date_font, date_size)
     c.drawString(78, 108, date_issued)
@@ -1661,30 +1663,114 @@ def build_certificate_pdf(full_name, profession_key, output_path, date_issued=No
     return output_path
 
 
-async def generate_and_send_certificate(session, context):
+async def generate_certificate_file(session):
+    ensure_certificate_output_dir()
     user_id = session["user_id"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(CERT_OUTPUT_DIR, f"certificate_{user_id}_{timestamp}.pdf")
     date_issued = format_certificate_date()
 
+    pdf_path = await asyncio.to_thread(
+        build_certificate_pdf,
+        session.get("full_name") or "Student Name",
+        session.get("profession"),
+        output_path,
+        date_issued,
+    )
+    return pdf_path, date_issued
+
+
+def build_admin_certificate_caption(session, date_issued):
+    profession = PROFESSIONS[session["profession"]]
+    cert_title = get_certificate_course_title(session["profession"])
+    username = f"@{session['username']}" if session.get("username") else "без username"
+
+    return (
+        f"{profession['marker']} Новый результат теста 2026UP\n\n"
+        f"Профессия: {profession['title']}\n"
+        f"Certificate title: {cert_title}\n"
+        f"Результат: {session['score']}/{TEST_SIZE}\n"
+        f"ФИО: {session.get('full_name') or '-'}\n"
+        f"LinkedIn: {session.get('linkedin_url') or '-'}\n"
+        f"Дата сертификата: {date_issued}\n\n"
+        f"Имя в Telegram: {session.get('first_name') or '-'}\n"
+        f"Username: {username}\n"
+        f"Telegram ID: {session['user_id']}\n\n"
+        "Проверьте PDF и нажмите кнопку ниже, чтобы отправить сертификат пользователю."
+    )
+
+
+async def send_certificate_preview_to_admin(session, context):
+    pdf_path = None
     try:
-        pdf_path = await asyncio.to_thread(
-            build_certificate_pdf,
-            session.get("full_name") or "Student Name",
-            session.get("profession"),
-            output_path,
-            date_issued,
+        pdf_path, date_issued = await generate_certificate_file(session)
+        caption = build_admin_certificate_caption(session, date_issued)
+
+        with open(pdf_path, "rb") as f:
+            sent_message = await context.bot.send_document(
+                chat_id=ADMIN_CHAT_ID,
+                document=f,
+                filename="2026UP_Verified_Certificate.pdf",
+                caption=caption,
+                reply_markup=get_admin_result_keyboard(session["user_id"]),
+            )
+
+        save_admin_message_link(
+            admin_chat_id=ADMIN_CHAT_ID,
+            admin_message_id=sent_message.message_id,
+            target_user_id=session["user_id"],
         )
+        return True, None
+    except Exception as e:
+        error_text = str(e)
+        profession = PROFESSIONS[session["profession"]]
+        username = f"@{session['username']}" if session.get("username") else "без username"
+        text = (
+            f"{profession['marker']} Новый результат теста 2026UP\n\n"
+            f"Профессия: {profession['title']}\n"
+            f"Результат: {session['score']}/{TEST_SIZE}\n"
+            f"ФИО: {session.get('full_name') or '-'}\n"
+            f"LinkedIn: {session.get('linkedin_url') or '-'}\n\n"
+            f"Имя в Telegram: {session.get('first_name') or '-'}\n"
+            f"Username: {username}\n"
+            f"Telegram ID: {session['user_id']}\n\n"
+            f"❌ Не удалось сгенерировать PDF сертификата для проверки.\nПричина: {error_text}"
+        )
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+        return False, error_text
+    finally:
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except Exception:
+                pass
+
+
+async def resend_certificate_to_user(target_user_id, context):
+    session = get_certificate_data_for_user(target_user_id)
+    if not session:
+        return False, "Данные пользователя для сертификата не найдены"
+
+    if not session.get("full_name"):
+        return False, "Не найдено ФИО пользователя"
+
+    if not session.get("profession"):
+        return False, "Не найдена профессия пользователя"
+
+    pdf_path = None
+    try:
+        pdf_path, date_issued = await generate_certificate_file(session)
+        course_title = get_certificate_course_title(session.get("profession"))
 
         with open(pdf_path, "rb") as f:
             await context.bot.send_document(
-                chat_id=user_id,
+                chat_id=target_user_id,
                 document=f,
                 filename="2026UP_Verified_Certificate.pdf",
                 caption=(
-                    "🏅 Ваш сертификат готов.\n\n"
-                    f"Курс: {get_certificate_course_title(session.get('profession'))}\n"
-                    f"Дата выдачи: {date_issued}"
+                    "🏅 Verified Certificate of Completion\n\n"
+                    f"Course: {course_title}\n"
+                    f"Date issued: {date_issued}"
                 ),
             )
 
@@ -1692,9 +1778,9 @@ async def generate_and_send_certificate(session, context):
     except Exception as e:
         return False, str(e)
     finally:
-        if os.path.exists(output_path):
+        if pdf_path and os.path.exists(pdf_path):
             try:
-                os.remove(output_path)
+                os.remove(pdf_path)
             except Exception:
                 pass
 
@@ -1703,33 +1789,7 @@ async def generate_and_send_certificate(session, context):
 # ADMIN NOTIFY
 # =========================
 async def send_result_to_admin(session, context):
-    profession = PROFESSIONS[session["profession"]]
-    username = f"@{session['username']}" if session.get("username") else "без username"
-
-    text = (
-        f"{profession['marker']} Новый результат теста 2026UP\n\n"
-        f"Профессия: {profession['title']}\n"
-        f"Результат: {session['score']}/{TEST_SIZE}\n"
-        f"ФИО: {session.get('full_name') or '-'}\n"
-        f"LinkedIn: {session.get('linkedin_url') or '-'}\n\n"
-        f"Имя в Telegram: {session.get('first_name') or '-'}\n"
-        f"Username: {username}\n"
-        f"Telegram ID: {session['user_id']}\n"
-        f"Дата: {now_str()}\n\n"
-        "↩️ Чтобы ответить пользователю, просто ответьте на это сообщение обычным reply."
-    )
-
-    sent_message = await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=text,
-        reply_markup=get_admin_result_keyboard(session["user_id"]),
-    )
-
-    save_admin_message_link(
-        admin_chat_id=ADMIN_CHAT_ID,
-        admin_message_id=sent_message.message_id,
-        target_user_id=session["user_id"],
-    )
+    return await send_certificate_preview_to_admin(session, context)
 
 
 # =========================
@@ -1969,27 +2029,20 @@ async def finalize_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save_result_record(session)
-    await send_result_to_admin(session, context)
+    preview_sent, preview_error = await send_result_to_admin(session, context)
 
     profession = PROFESSIONS[session["profession"]]
     save_action(user, f"Отправил финальные данные: {profession['title']} | {session['score']}/{TEST_SIZE}")
-
-    certificate_sent, certificate_error = await generate_and_send_certificate(session, context)
-    if certificate_sent:
-        save_action(user, "Сертификат PDF успешно отправлен пользователю")
-    else:
-        save_action(user, f"Ошибка генерации сертификата: {certificate_error}")
-        print(f"Certificate generation error for user {user.id}: {certificate_error}")
 
     final_text = (
         FINAL_THANKS_TEXT
         + f"\n\nПрофессия: {profession['title']}\nРезультат: {session['score']}/{TEST_SIZE}"
     )
 
-    if certificate_sent:
-        final_text += "\n\n📄 Именной PDF-сертификат уже отправлен вам в этот чат."
+    if preview_sent:
+        final_text += "\n\n📄 Ваш сертификат отправлен в приватную группу на проверку. После подтверждения администратором бот пришлёт его вам в этот чат."
     else:
-        final_text += "\n\n⚠️ Результат сохранён, но автоматически отправить сертификат не удалось. Проверьте доступность шаблона PDF по ссылке и попробуйте позже."
+        final_text += f"\n\n⚠️ Результат отправлен на проверку, но PDF-сертификат пока не удалось подготовить для админа. Причина: {preview_error}"
 
     await update.message.reply_text(
         final_text,
@@ -2100,26 +2153,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_check_access(query, context, profession_key)
         return
 
-    if data == "send_my_certificate":
-        sent, error_text = await resend_certificate_to_user(query.from_user.id, context)
-        if sent:
-            await query.answer("Сертификат отправлен в этот чат", show_alert=True)
-        else:
-            await query.answer("Не удалось отправить сертификат", show_alert=False)
-            await query.message.reply_text(
-                "⚠️ Не удалось отправить сертификат автоматически\n"
-                f"Причина: {error_text}"
-            )
-        return
-
     if data.startswith("send_certificate:"):
+        if not query.message or query.message.chat_id != ADMIN_CHAT_ID:
+            await query.answer("Эта кнопка работает только в приватной группе админов", show_alert=True)
+            return
+
         _, raw_user_id = data.split(":")
         target_user_id = int(raw_user_id)
         sent, error_text = await resend_certificate_to_user(target_user_id, context)
         if sent:
-            save_action(query.from_user, f"Повторно отправил сертификат пользователю {target_user_id}")
+            save_action(query.from_user, f"Отправил сертификат пользователю {target_user_id}")
             await query.answer("Сертификат отправлен пользователю", show_alert=True)
-            await query.message.reply_text(f"✅ Сертификат повторно отправлен пользователю {target_user_id}.")
+            await query.message.reply_text(f"✅ Сертификат отправлен пользователю {target_user_id}.")
         else:
             await query.answer("Не удалось отправить сертификат", show_alert=False)
             await query.message.reply_text(

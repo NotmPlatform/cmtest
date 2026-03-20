@@ -44,6 +44,9 @@ TEST_SIZE = 15
 CERT_TEMPLATE_URL = os.getenv("CERT_TEMPLATE_URL", "https://2026up.ru/verify/Certificate.pdf")
 CERT_TEMPLATE_CACHE_PATH = os.getenv("CERT_TEMPLATE_CACHE_PATH", "certificate_template_cache.pdf")
 CERT_OUTPUT_DIR = os.getenv("CERT_OUTPUT_DIR", "generated_certificates")
+WP_CERT_API_URL = os.getenv("WP_CERT_API_URL", "https://2026up.ru/wp-json/2026up/v1/certificate")
+WP_CERT_API_TOKEN = os.getenv("WP_CERT_API_TOKEN", "")
+SITE_SYNC_TIMEOUT = int(os.getenv("SITE_SYNC_TIMEOUT", "25"))
 
 if not BOT_TOKEN:
     raise ValueError("Не найдена переменная окружения BOT_TOKEN")
@@ -1696,12 +1699,12 @@ def build_certificate_pdf(full_name, profession_key, output_path, date_issued=No
     return output_path
 
 
-async def generate_certificate_file(session):
+async def generate_certificate_file(session, date_issued=None):
     ensure_certificate_output_dir()
     user_id = session["user_id"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(CERT_OUTPUT_DIR, f"certificate_{user_id}_{timestamp}.pdf")
-    date_issued = format_certificate_date()
+    date_issued = date_issued or format_certificate_date()
 
     pdf_path = await asyncio.to_thread(
         build_certificate_pdf,
@@ -1711,6 +1714,59 @@ async def generate_certificate_file(session):
         date_issued,
     )
     return pdf_path, date_issued
+
+
+def sync_certificate_to_site(session, date_issued):
+    if not WP_CERT_API_URL:
+        raise RuntimeError("Не задан WP_CERT_API_URL")
+
+    if not WP_CERT_API_TOKEN:
+        raise RuntimeError("Не задан WP_CERT_API_TOKEN")
+
+    full_name = (session.get("full_name") or "").strip()
+    profession_key = session.get("profession")
+    if not full_name:
+        raise RuntimeError("Не найдено ФИО пользователя для синхронизации с сайтом")
+
+    if not profession_key:
+        raise RuntimeError("Не найдена профессия пользователя для синхронизации с сайтом")
+
+    payload = {
+        "token": WP_CERT_API_TOKEN,
+        "full_name": full_name,
+        "course_title": get_certificate_course_title(profession_key),
+        "date_issued": date_issued,
+        "telegram_user_id": session["user_id"],
+        "profession_key": profession_key,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-2026UP-Token": WP_CERT_API_TOKEN,
+    }
+
+    response = requests.post(
+        WP_CERT_API_URL,
+        headers=headers,
+        json=payload,
+        timeout=SITE_SYNC_TIMEOUT,
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+
+    if response.status_code >= 400:
+        server_error = None
+        if isinstance(data, dict):
+            server_error = data.get("error") or data.get("message")
+        raise RuntimeError(server_error or f"Сайт вернул HTTP {response.status_code}")
+
+    if isinstance(data, dict) and not data.get("ok", False):
+        raise RuntimeError(data.get("error") or "Сайт не подтвердил запись сертификата")
+
+    return True
 
 
 def build_admin_certificate_caption(session, date_issued):
@@ -1792,7 +1848,10 @@ async def resend_certificate_to_user(target_user_id, context):
 
     pdf_path = None
     try:
-        pdf_path, date_issued = await generate_certificate_file(session)
+        date_issued = format_certificate_date()
+        await asyncio.to_thread(sync_certificate_to_site, session, date_issued)
+
+        pdf_path, date_issued = await generate_certificate_file(session, date_issued=date_issued)
         course_title = get_certificate_course_title(session.get("profession"))
 
         with open(pdf_path, "rb") as f:
@@ -2201,7 +2260,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("Не удалось отправить сертификат", show_alert=False)
             await query.message.reply_text(
-                "❌ Не удалось отправить сертификат пользователю.\n"
+                "❌ Не удалось отправить сертификат пользователю или записать его в реестр сайта.\n"
                 f"Причина: {error_text}"
             )
         return

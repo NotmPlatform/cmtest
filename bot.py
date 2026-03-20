@@ -47,7 +47,9 @@ try:
     MARKETING_GROUP_ID = int(MARKETING_GROUP_ID_RAW)
     BD_GROUP_ID = int(BD_GROUP_ID_RAW)
 except ValueError as e:
-    raise ValueError("ADMIN_CHAT_ID / CM_GROUP_ID / MARKETING_GROUP_ID / BD_GROUP_ID должны быть числом, например -1001234567890") from e
+    raise ValueError(
+        "ADMIN_CHAT_ID / CM_GROUP_ID / MARKETING_GROUP_ID / BD_GROUP_ID должны быть числом, например -1001234567890"
+    ) from e
 
 
 # =========================
@@ -699,8 +701,7 @@ QUESTION_BANK = {'cm': [{'question': 'Какая главная цель Communi
                             'Использовать одинаковые мемы без проверки'],
                 'correct': 0},
                {'question': 'Что такое growth loop?',
-                'options': ['Механика, при которой продукт или кампания сами создают следующий цикл '
-                            'привлечения/активации',
+                'options': ['Механика, при которой продукт или кампания сами создают следующий цикл привлечения/активации',
                             'Круглый логотип',
                             'Закрытый рабочий чат',
                             'Список задач дизайнера'],
@@ -820,8 +821,7 @@ QUESTION_BANK = {'cm': [{'question': 'Какая главная цель Communi
                      'Ничего'],
          'correct': 0},
         {'question': "Как лучше реагировать на возражение 'нам это неинтересно'?",
-         'options': ['Уточнить причину, проверить fit и при необходимости корректно закрыть диалог или предложить иной '
-                     'угол',
+         'options': ['Уточнить причину, проверить fit и при необходимости корректно закрыть диалог или предложить иной угол',
                      'Спорить до победы',
                      'Игнорировать',
                      'Сразу снижать цену вдвое без понимания'],
@@ -983,8 +983,7 @@ QUESTION_BANK = {'cm': [{'question': 'Какая главная цель Communi
                      'Отсутствие деталей'],
          'correct': 0},
         {'question': 'Чем отличается sponsorship от performance-партнёрства?',
-         'options': ['В sponsorship часто платят за бренд/экспозицию, а performance сильнее завязан на измеримый '
-                     'результат',
+         'options': ['В sponsorship часто платят за бренд/экспозицию, а performance сильнее завязан на измеримый результат',
                      'Ничем',
                      'Performance не бывает в Web3',
                      'Sponsorship всегда бесплатный'],
@@ -996,8 +995,7 @@ QUESTION_BANK = {'cm': [{'question': 'Какая главная цель Communi
                      'Чтобы менять логотип'],
          'correct': 0},
         {'question': 'Что делать, если сделка зависла без ответа?',
-         'options': ['Сделать разумный follow-up, предложить конкретный вариант next step и при необходимости '
-                     'перевести в dormant',
+         'options': ['Сделать разумный follow-up, предложить конкретный вариант next step и при необходимости перевести в dormant',
                      'Спамить ежедневно',
                      'Удалить контакт',
                      'Сразу писать в общий чат партнёра'],
@@ -1093,6 +1091,16 @@ def init_db():
             first_name TEXT,
             action_text TEXT NOT NULL,
             created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_message_links (
+            admin_chat_id INTEGER NOT NULL,
+            admin_message_id INTEGER NOT NULL,
+            target_user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (admin_chat_id, admin_message_id)
         )
     """)
 
@@ -1246,6 +1254,37 @@ def save_action(user, action_text):
     conn.close()
 
 
+def save_admin_message_link(admin_chat_id, admin_message_id, target_user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO admin_message_links (
+            admin_chat_id, admin_message_id, target_user_id, created_at
+        )
+        VALUES (?, ?, ?, ?)
+    """, (
+        admin_chat_id,
+        admin_message_id,
+        target_user_id,
+        now_str(),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_target_user_id_by_admin_message(admin_chat_id, admin_message_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT target_user_id
+        FROM admin_message_links
+        WHERE admin_chat_id = ? AND admin_message_id = ?
+    """, (admin_chat_id, admin_message_id))
+    row = cur.fetchone()
+    conn.close()
+    return row["target_user_id"] if row else None
+
+
 # =========================
 # HELPERS
 # =========================
@@ -1368,7 +1407,10 @@ def build_access_text(profession_key):
 async def check_membership(bot, user_id, chat_id):
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return member.status in ACTIVE_MEMBER_STATUSES, None
+        is_active = member.status in ACTIVE_MEMBER_STATUSES
+        if member.status == ChatMemberStatus.RESTRICTED:
+            is_active = bool(getattr(member, "is_member", False))
+        return is_active, None
     except Exception as e:
         return False, str(e)
 
@@ -1450,9 +1492,20 @@ async def send_result_to_admin(session, context):
         f"Имя в Telegram: {session.get('first_name') or '-'}\n"
         f"Username: {username}\n"
         f"Telegram ID: {session['user_id']}\n"
-        f"Дата: {now_str()}"
+        f"Дата: {now_str()}\n\n"
+        "↩️ Чтобы ответить пользователю, просто ответьте на это сообщение обычным reply."
     )
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+
+    sent_message = await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=text
+    )
+
+    save_admin_message_link(
+        admin_chat_id=ADMIN_CHAT_ID,
+        admin_message_id=sent_message.message_id,
+        target_user_id=session["user_id"],
+    )
 
 
 # =========================
@@ -1705,19 +1758,53 @@ async def finalize_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    message = update.message
+
+    if not message:
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    # =========================================
+    # ОТВЕТ АДМИНА ПОЛЬЗОВАТЕЛЮ ЧЕРЕЗ ОБЫЧНЫЙ REPLY В ГРУППЕ
+    # =========================================
+    if message.chat_id == ADMIN_CHAT_ID and message.reply_to_message:
+        replied_message_id = message.reply_to_message.message_id
+
+        target_user_id = get_target_user_id_by_admin_message(
+            admin_chat_id=ADMIN_CHAT_ID,
+            admin_message_id=replied_message_id,
+        )
+
+        if target_user_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=(
+                        "📩 Ответ по вашему тесту 2026UP\n\n"
+                        f"{text}"
+                    )
+                )
+                await message.reply_text("✅ Ответ отправлен пользователю.")
+                save_action(user, f"Ответил пользователю {target_user_id} через reply в админ-группе")
+            except Exception as e:
+                await message.reply_text(f"❌ Не удалось отправить сообщение пользователю: {e}")
+            return
+
+    # =========================================
+    # ОБЫЧНАЯ ЛОГИКА ПОЛЬЗОВАТЕЛЯ
+    # =========================================
     session = get_session(user.id)
 
     if not session:
         return
 
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-
     if session["state"] == "awaiting_full_name":
         full_name_value = normalize_full_name(text)
         if full_name_value is None:
-            await update.message.reply_text(
+            await message.reply_text(
                 "Пожалуйста, введите ваше ФИО только на английском языке.\n"
                 "Пример: Ivan Ivanov"
             )
@@ -1725,13 +1812,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         update_session_from_user(user, full_name=full_name_value, state="awaiting_linkedin")
         save_action(user, "Указал ФИО на английском")
-        await update.message.reply_text(ASK_LINKEDIN_TEXT)
+        await message.reply_text(ASK_LINKEDIN_TEXT)
         return
 
     if session["state"] == "awaiting_linkedin":
         linkedin_value = normalize_linkedin(text)
         if linkedin_value is None:
-            await update.message.reply_text(
+            await message.reply_text(
                 "Пожалуйста, отправьте корректную ссылку на LinkedIn.\n"
                 "Пример: https://www.linkedin.com/in/ivan-ivanov"
             )

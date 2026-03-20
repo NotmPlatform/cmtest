@@ -114,8 +114,8 @@ ACCESS_DENIED_TEXT = """
 ASK_FULL_NAME_TEXT = """
 Тест завершён.
 
-Please enter your full name in English.
-Example: Ivan Ivanov
+Пожалуйста введите ваше имя и фамилию на латинице.
+Пример: Ivan Ivanov
 """.strip()
 
 ASK_LINKEDIN_TEXT = """

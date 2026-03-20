@@ -1304,6 +1304,44 @@ def get_target_user_id_by_admin_message(admin_chat_id, admin_message_id):
     return row["target_user_id"] if row else None
 
 
+def get_latest_result_by_user(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM test_results
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (user_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "user_id": row["user_id"],
+        "username": row["username"],
+        "first_name": row["first_name"],
+        "profession": row["profession"],
+        "score": row["score"],
+        "total_questions": row["total_questions"],
+        "full_name": row["full_name"],
+        "linkedin_url": row["linkedin_url"],
+        "question_ids": json.loads(row["question_ids_json"] or "[]"),
+        "answers": json.loads(row["answers_json"] or "[]"),
+        "created_at": row["created_at"],
+    }
+
+
+def get_certificate_data_for_user(user_id):
+    session = get_session(user_id)
+    if session and session.get("full_name") and session.get("profession"):
+        return session
+    return get_latest_result_by_user(user_id)
+
+
 # =========================
 # HELPERS
 # =========================
@@ -1345,8 +1383,15 @@ def get_access_keyboard(profession_key):
 
 def get_after_finish_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Получить сертификат ещё раз", callback_data="send_my_certificate")],
         [InlineKeyboardButton("Пройти ещё один тест", callback_data="restart_test")],
         [InlineKeyboardButton("Написать менеджеру", url=MANAGER_URL)],
+    ])
+
+
+def get_admin_result_keyboard(target_user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Отправить сертификат пользователю", callback_data=f"send_certificate:{target_user_id}")],
     ])
 
 
@@ -1530,6 +1575,8 @@ def download_certificate_template_bytes():
         response = requests.get(CERT_TEMPLATE_URL, timeout=30)
         response.raise_for_status()
         content = response.content
+        if not content.startswith(b"%PDF"):
+            raise RuntimeError("По ссылке шаблона вернулся не PDF-файл")
         with open(CERT_TEMPLATE_CACHE_PATH, "wb") as f:
             f.write(content)
         return content
@@ -1538,7 +1585,9 @@ def download_certificate_template_bytes():
 
     if os.path.exists(CERT_TEMPLATE_CACHE_PATH):
         with open(CERT_TEMPLATE_CACHE_PATH, "rb") as f:
-            return f.read()
+            cached = f.read()
+        if cached.startswith(b"%PDF"):
+            return cached
 
     raise RuntimeError(f"Не удалось скачать шаблон сертификата: {last_error}")
 
@@ -1672,7 +1721,8 @@ async def send_result_to_admin(session, context):
 
     sent_message = await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
-        text=text
+        text=text,
+        reply_markup=get_admin_result_keyboard(session["user_id"]),
     )
 
     save_admin_message_link(
@@ -2048,6 +2098,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("check_access:"):
         _, profession_key = data.split(":")
         await handle_check_access(query, context, profession_key)
+        return
+
+    if data == "send_my_certificate":
+        sent, error_text = await resend_certificate_to_user(query.from_user.id, context)
+        if sent:
+            await query.answer("Сертификат отправлен в этот чат", show_alert=True)
+        else:
+            await query.answer("Не удалось отправить сертификат", show_alert=False)
+            await query.message.reply_text(
+                "⚠️ Не удалось отправить сертификат автоматически\n"
+                f"Причина: {error_text}"
+            )
+        return
+
+    if data.startswith("send_certificate:"):
+        _, raw_user_id = data.split(":")
+        target_user_id = int(raw_user_id)
+        sent, error_text = await resend_certificate_to_user(target_user_id, context)
+        if sent:
+            save_action(query.from_user, f"Повторно отправил сертификат пользователю {target_user_id}")
+            await query.answer("Сертификат отправлен пользователю", show_alert=True)
+            await query.message.reply_text(f"✅ Сертификат повторно отправлен пользователю {target_user_id}.")
+        else:
+            await query.answer("Не удалось отправить сертификат", show_alert=False)
+            await query.message.reply_text(
+                "❌ Не удалось отправить сертификат пользователю.\n"
+                f"Причина: {error_text}"
+            )
         return
 
     if data.startswith("answer:"):

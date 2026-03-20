@@ -1,19 +1,20 @@
-# -*- coding: utf-8 -*-
+# requirements: python-telegram-bot, requests, reportlab, pypdf
+
 import os
+import io
 import json
 import sqlite3
 import random
 import re
-from io import BytesIO
-from pathlib import Path
+import asyncio
 from urllib.parse import urlparse
 from datetime import datetime
 
-import fitz
 import requests
 from pypdf import PdfReader, PdfWriter
-from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase.pdfmetrics import stringWidth
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
@@ -40,9 +41,9 @@ BD_GROUP_ID_RAW = os.getenv("BD_GROUP_ID")
 DB_PATH = os.getenv("DB_PATH", "2026up_exam_bot.db")
 TEST_SIZE = 15
 
-CERT_TEMPLATE_SOURCE = os.getenv("CERT_TEMPLATE_SOURCE", "https://2026up.ru/verify/Certificate.pdf")
-CERT_CACHE_DIR = Path(os.getenv("CERT_CACHE_DIR", "cert_cache"))
-CERT_OUTPUT_DIR = Path(os.getenv("CERT_OUTPUT_DIR", "generated_certificates"))
+CERT_TEMPLATE_URL = os.getenv("CERT_TEMPLATE_URL", "https://2026up.ru/verify/Certificate.pdf")
+CERT_TEMPLATE_CACHE_PATH = os.getenv("CERT_TEMPLATE_CACHE_PATH", "certificate_template_cache.pdf")
+CERT_OUTPUT_DIR = os.getenv("CERT_OUTPUT_DIR", "generated_certificates")
 
 if not BOT_TOKEN:
     raise ValueError("Не найдена переменная окружения BOT_TOKEN")
@@ -63,8 +64,6 @@ except ValueError as e:
         "ADMIN_CHAT_ID / CM_GROUP_ID / MARKETING_GROUP_ID / BD_GROUP_ID должны быть числом, например -1001234567890"
     ) from e
 
-CERT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CERT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================
 # CONFIG
@@ -72,19 +71,16 @@ CERT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PROFESSIONS = {
     "cm": {
         "title": "CM в Web3",
-        "certificate_title": "COMMUNITY MANAGEMENT IN WEB3",
         "marker": "#CM",
         "group_id": CM_GROUP_ID,
     },
     "marketing": {
         "title": "Web3 Маркетолог",
-        "certificate_title": "WEB3 MARKETING",
         "marker": "#MARKETING",
         "group_id": MARKETING_GROUP_ID,
     },
     "bd": {
         "title": "BD в Web3",
-        "certificate_title": "BUSINESS DEVELOPMENT IN WEB3",
         "marker": "#BD",
         "group_id": BD_GROUP_ID,
     },
@@ -95,6 +91,12 @@ ACTIVE_MEMBER_STATUSES = {
     ChatMemberStatus.ADMINISTRATOR,
     ChatMemberStatus.OWNER,
     ChatMemberStatus.RESTRICTED,
+}
+
+CERTIFICATE_COURSE_TITLES = {
+    "cm": "Community Management in Web3",
+    "marketing": "Web3 Marketing",
+    "bd": "Business Development in Web3",
 }
 
 WELCOME_TEXT = """
@@ -1049,16 +1051,11 @@ QUESTION_BANK = {'cm': [{'question': 'Какая главная цель Communi
          'correct': 0}]}
 
 
-
 # =========================
 # DB
 # =========================
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def now_dt():
-    return datetime.now()
 
 
 def get_conn():
@@ -1123,25 +1120,6 @@ def init_db():
             target_user_id INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY (admin_chat_id, admin_message_id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS certificate_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            profession TEXT NOT NULL,
-            certificate_title TEXT NOT NULL,
-            full_name TEXT NOT NULL,
-            linkedin_url TEXT,
-            issue_date TEXT NOT NULL,
-            pdf_path TEXT NOT NULL,
-            preview_path TEXT,
-            admin_chat_id INTEGER,
-            admin_message_id INTEGER,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            sent_at TEXT
         )
     """)
 
@@ -1324,189 +1302,6 @@ def get_target_user_id_by_admin_message(admin_chat_id, admin_message_id):
     row = cur.fetchone()
     conn.close()
     return row["target_user_id"] if row else None
-
-
-def create_certificate_request(user_id, profession, certificate_title, full_name, linkedin_url, issue_date, pdf_path, preview_path):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO certificate_requests (
-            user_id, profession, certificate_title, full_name, linkedin_url,
-            issue_date, pdf_path, preview_path, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        profession,
-        certificate_title,
-        full_name,
-        linkedin_url,
-        issue_date,
-        str(pdf_path),
-        str(preview_path) if preview_path else None,
-        now_str(),
-    ))
-    request_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return request_id
-
-
-def attach_admin_message_to_certificate_request(request_id, admin_chat_id, admin_message_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE certificate_requests
-        SET admin_chat_id = ?, admin_message_id = ?
-        WHERE id = ?
-    """, (admin_chat_id, admin_message_id, request_id))
-    conn.commit()
-    conn.close()
-
-
-def get_certificate_request(request_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM certificate_requests WHERE id = ?", (request_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def mark_certificate_sent(request_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE certificate_requests
-        SET status = 'sent', sent_at = ?
-        WHERE id = ?
-    """, (now_str(), request_id))
-    conn.commit()
-    conn.close()
-
-
-# =========================
-# CERTIFICATE HELPERS
-# =========================
-MONTHS_EN = {
-    1: "January", 2: "February", 3: "March", 4: "April",
-    5: "May", 6: "June", 7: "July", 8: "August",
-    9: "September", 10: "October", 11: "November", 12: "December",
-}
-
-
-def format_issue_date_en(dt):
-    return f"{dt.day:02d} {MONTHS_EN[dt.month]} {dt.year}"
-
-
-def sanitize_filename(value):
-    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    return value.strip("_") or "certificate"
-
-
-def ensure_certificate_template():
-    source = CERT_TEMPLATE_SOURCE.strip()
-    if source.startswith(("http://", "https://")):
-        target = CERT_CACHE_DIR / "certificate_template.pdf"
-        if target.exists() and target.stat().st_size > 0:
-            return target
-
-        response = requests.get(source, timeout=30)
-        response.raise_for_status()
-        target.write_bytes(response.content)
-        return target
-
-    path = Path(source)
-    if not path.exists():
-        raise FileNotFoundError(f"Шаблон сертификата не найден: {path}")
-    return path
-
-
-def fit_font_size(c, text, font_name, max_size, min_size, max_width):
-    size = max_size
-    while size > min_size and c.stringWidth(text, font_name, size) > max_width:
-        size -= 0.5
-    return size
-
-
-def generate_certificate_pdf(full_name, certificate_title, issue_date, user_id):
-    template_path = ensure_certificate_template()
-    reader = PdfReader(str(template_path))
-    base_page = reader.pages[0]
-    page_width = float(base_page.mediabox.width)
-    page_height = float(base_page.mediabox.height)
-
-    overlay_stream = BytesIO()
-    c = canvas.Canvas(overlay_stream, pagesize=(page_width, page_height))
-
-    bg = HexColor("#f0f3fb")
-    dark = HexColor("#19356f")
-
-    # Маски над placeholder-полями шаблона.
-    c.setFillColor(bg)
-    c.rect(282, 242, 280, 36, fill=1, stroke=0)   # full name
-    c.rect(220, 178, 402, 44, fill=1, stroke=0)   # course title
-    c.rect(75, 138, 165, 28, fill=1, stroke=0)    # issue date
-
-    # Full Name
-    c.setFillColor(dark)
-    name_font = "Times-Italic"
-    name_size = fit_font_size(c, full_name, name_font, 24, 16, 270)
-    c.setFont(name_font, name_size)
-    c.drawCentredString(page_width / 2, 252, full_name)
-
-    # Course Title
-    course_text = certificate_title.upper()
-    course_font = "Helvetica-Bold"
-    course_size = fit_font_size(c, course_text, course_font, 17, 10, 390)
-    c.setFont(course_font, course_size)
-    c.drawCentredString(page_width / 2, 194, course_text)
-
-    # Issue Date
-    date_text = issue_date.upper()
-    date_font = "Helvetica-Bold"
-    date_size = fit_font_size(c, date_text, date_font, 14, 9, 155)
-    c.setFont(date_font, date_size)
-    c.drawString(77, 145, date_text)
-
-    c.save()
-    overlay_stream.seek(0)
-
-    overlay_pdf = PdfReader(overlay_stream)
-    base_page.merge_page(overlay_pdf.pages[0])
-
-    writer = PdfWriter()
-    writer.add_page(base_page)
-
-    filename = sanitize_filename(f"certificate_{user_id}_{full_name}_{issue_date}.pdf")
-    output_path = CERT_OUTPUT_DIR / filename
-    with open(output_path, "wb") as f:
-        writer.write(f)
-
-    return output_path
-
-
-def render_certificate_preview(pdf_path):
-    pdf_path = Path(pdf_path)
-    preview_path = pdf_path.with_suffix(".png")
-
-    doc = fitz.open(str(pdf_path))
-    pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-    pix.save(str(preview_path))
-    doc.close()
-
-    return preview_path
-
-
-def get_admin_certificate_keyboard(request_id, is_sent=False):
-    if is_sent:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Сертификат отправлен", callback_data=f"sent_certificate:{request_id}")]
-        ])
-
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Отправить сертификат пользователю", callback_data=f"send_certificate:{request_id}")]
-    ])
 
 
 # =========================
@@ -1701,85 +1496,190 @@ def build_resume_text(session):
 
 
 # =========================
+# CERTIFICATE PDF
+# =========================
+def ensure_certificate_output_dir():
+    os.makedirs(CERT_OUTPUT_DIR, exist_ok=True)
+
+
+def format_certificate_date(dt=None):
+    dt = dt or datetime.now()
+    months = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+    return f"{dt.day:02d} {months[dt.month - 1]} {dt.year}"
+
+
+def get_certificate_course_title(profession_key):
+    return CERTIFICATE_COURSE_TITLES.get(profession_key, PROFESSIONS.get(profession_key, {}).get("title", "Web3 Course"))
+
+
+def fit_font_size(text, font_name, max_width, max_size, min_size):
+    text = text or ""
+    size = max_size
+    while size > min_size and stringWidth(text, font_name, size) > max_width:
+        size -= 1
+    return max(size, min_size)
+
+
+def download_certificate_template_bytes():
+    last_error = None
+
+    try:
+        response = requests.get(CERT_TEMPLATE_URL, timeout=30)
+        response.raise_for_status()
+        content = response.content
+        with open(CERT_TEMPLATE_CACHE_PATH, "wb") as f:
+            f.write(content)
+        return content
+    except Exception as e:
+        last_error = e
+
+    if os.path.exists(CERT_TEMPLATE_CACHE_PATH):
+        with open(CERT_TEMPLATE_CACHE_PATH, "rb") as f:
+            return f.read()
+
+    raise RuntimeError(f"Не удалось скачать шаблон сертификата: {last_error}")
+
+
+def create_certificate_overlay(full_name, course_title, date_issued, page_width, page_height):
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(float(page_width), float(page_height)))
+
+    name_font = "Times-Italic"
+    course_font = "Helvetica-Bold"
+    date_font = "Helvetica-Bold"
+    brand_r, brand_g, brand_b = (0.10, 0.20, 0.42)
+    c.setFillColorRGB(brand_r, brand_g, brand_b)
+
+    center_x = float(page_width) / 2
+
+    # ФИО
+    name_max_width = 470
+    name_size = fit_font_size(full_name, name_font, name_max_width, 32, 20)
+    c.setFont(name_font, name_size)
+    c.drawCentredString(center_x, 288, full_name)
+
+    # Профессия / курс
+    course_max_width = 430
+    course_size = fit_font_size(course_title, course_font, course_max_width, 22, 12)
+    c.setFont(course_font, course_size)
+    c.drawCentredString(center_x, 178, course_title)
+
+    # Дата
+    date_size = fit_font_size(date_issued, date_font, 155, 16, 10)
+    c.setFont(date_font, date_size)
+    c.drawString(78, 108, date_issued)
+
+    c.save()
+    packet.seek(0)
+    return packet
+
+
+def build_certificate_pdf(full_name, profession_key, output_path, date_issued=None):
+    ensure_certificate_output_dir()
+
+    full_name = (full_name or "").strip()
+    course_title = get_certificate_course_title(profession_key)
+    date_issued = date_issued or format_certificate_date()
+
+    template_bytes = download_certificate_template_bytes()
+    template_reader = PdfReader(io.BytesIO(template_bytes))
+    if not template_reader.pages:
+        raise RuntimeError("PDF-шаблон сертификата пустой")
+
+    base_page = template_reader.pages[0]
+    page_width = float(base_page.mediabox.width)
+    page_height = float(base_page.mediabox.height)
+
+    overlay_stream = create_certificate_overlay(
+        full_name=full_name,
+        course_title=course_title,
+        date_issued=date_issued,
+        page_width=page_width,
+        page_height=page_height,
+    )
+    overlay_reader = PdfReader(overlay_stream)
+
+    writer = PdfWriter()
+    base_page.merge_page(overlay_reader.pages[0])
+    writer.add_page(base_page)
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    return output_path
+
+
+async def generate_and_send_certificate(session, context):
+    user_id = session["user_id"]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(CERT_OUTPUT_DIR, f"certificate_{user_id}_{timestamp}.pdf")
+    date_issued = format_certificate_date()
+
+    try:
+        pdf_path = await asyncio.to_thread(
+            build_certificate_pdf,
+            session.get("full_name") or "Student Name",
+            session.get("profession"),
+            output_path,
+            date_issued,
+        )
+
+        with open(pdf_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=f,
+                filename="2026UP_Verified_Certificate.pdf",
+                caption=(
+                    "🏅 Ваш сертификат готов.\n\n"
+                    f"Курс: {get_certificate_course_title(session.get('profession'))}\n"
+                    f"Дата выдачи: {date_issued}"
+                ),
+            )
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+
+
+# =========================
 # ADMIN NOTIFY
 # =========================
 async def send_result_to_admin(session, context):
     profession = PROFESSIONS[session["profession"]]
     username = f"@{session['username']}" if session.get("username") else "без username"
-    issue_date = format_issue_date_en(now_dt())
 
-    try:
-        cert_pdf_path = generate_certificate_pdf(
-            full_name=session.get("full_name") or "FULL NAME",
-            certificate_title=profession["certificate_title"],
-            issue_date=issue_date,
-            user_id=session["user_id"],
-        )
-        cert_preview_path = render_certificate_preview(cert_pdf_path)
-    except Exception as e:
-        fallback_text = (
-            f"{profession['marker']} Новый результат теста 2026UP\n\n"
-            f"Профессия: {profession['title']}\n"
-            f"Результат: {session['score']}/{TEST_SIZE}\n"
-            f"ФИО: {session.get('full_name') or '-'}\n"
-            f"LinkedIn: {session.get('linkedin_url') or '-'}\n\n"
-            f"Имя в Telegram: {session.get('first_name') or '-'}\n"
-            f"Username: {username}\n"
-            f"Telegram ID: {session['user_id']}\n"
-            f"Дата: {now_str()}\n\n"
-            f"⚠️ Не удалось сформировать сертификат: {e}\n"
-            "↩️ Чтобы ответить пользователю, просто ответьте на это сообщение обычным reply."
-        )
-        sent_message = await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=fallback_text)
-        save_admin_message_link(ADMIN_CHAT_ID, sent_message.message_id, session["user_id"])
-        return
-
-    request_id = create_certificate_request(
-        user_id=session["user_id"],
-        profession=session["profession"],
-        certificate_title=profession["certificate_title"],
-        full_name=session.get("full_name") or "",
-        linkedin_url=session.get("linkedin_url") or "",
-        issue_date=issue_date,
-        pdf_path=cert_pdf_path,
-        preview_path=cert_preview_path,
-    )
-
-    caption = (
+    text = (
         f"{profession['marker']} Новый результат теста 2026UP\n\n"
         f"Профессия: {profession['title']}\n"
         f"Результат: {session['score']}/{TEST_SIZE}\n"
         f"ФИО: {session.get('full_name') or '-'}\n"
-        f"LinkedIn: {session.get('linkedin_url') or '-'}\n"
-        f"Дата сертификата: {issue_date}\n\n"
+        f"LinkedIn: {session.get('linkedin_url') or '-'}\n\n"
         f"Имя в Telegram: {session.get('first_name') or '-'}\n"
         f"Username: {username}\n"
-        f"Telegram ID: {session['user_id']}\n\n"
-        "↩️ Reply на это сообщение — чтобы ответить пользователю.\n"
-        "📤 Кнопка ниже отправит PDF-сертификат пользователю."
+        f"Telegram ID: {session['user_id']}\n"
+        f"Дата: {now_str()}\n\n"
+        "↩️ Чтобы ответить пользователю, просто ответьте на это сообщение обычным reply."
     )
 
-    with open(cert_preview_path, "rb") as preview_file:
-        preview_message = await context.bot.send_photo(
-            chat_id=ADMIN_CHAT_ID,
-            photo=preview_file,
-            caption=caption,
-            reply_markup=get_admin_certificate_keyboard(request_id, is_sent=False),
-        )
+    sent_message = await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=text
+    )
 
-    save_admin_message_link(ADMIN_CHAT_ID, preview_message.message_id, session["user_id"])
-    attach_admin_message_to_certificate_request(request_id, ADMIN_CHAT_ID, preview_message.message_id)
-
-    with open(cert_pdf_path, "rb") as pdf_file:
-        pdf_message = await context.bot.send_document(
-            chat_id=ADMIN_CHAT_ID,
-            document=pdf_file,
-            filename=Path(cert_pdf_path).name,
-            caption="PDF certificate file",
-            reply_to_message_id=preview_message.message_id,
-        )
-
-    save_admin_message_link(ADMIN_CHAT_ID, pdf_message.message_id, session["user_id"])
+    save_admin_message_link(
+        admin_chat_id=ADMIN_CHAT_ID,
+        admin_message_id=sent_message.message_id,
+        target_user_id=session["user_id"],
+    )
 
 
 # =========================
@@ -1820,9 +1720,6 @@ async def show_current_step(target_message, user):
 
 async def start_test(query, profession_key):
     question_pool_size = len(QUESTION_BANK[profession_key])
-    if question_pool_size < TEST_SIZE:
-        raise ValueError(f"Для {profession_key} должно быть минимум {TEST_SIZE} вопросов в QUESTION_BANK")
-
     question_ids = random.sample(range(question_pool_size), TEST_SIZE)
 
     session = update_session_from_user(
@@ -2027,8 +1924,25 @@ async def finalize_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profession = PROFESSIONS[session["profession"]]
     save_action(user, f"Отправил финальные данные: {profession['title']} | {session['score']}/{TEST_SIZE}")
 
+    certificate_sent, certificate_error = await generate_and_send_certificate(session, context)
+    if certificate_sent:
+        save_action(user, "Сертификат PDF успешно отправлен пользователю")
+    else:
+        save_action(user, f"Ошибка генерации сертификата: {certificate_error}")
+        print(f"Certificate generation error for user {user.id}: {certificate_error}")
+
+    final_text = (
+        FINAL_THANKS_TEXT
+        + f"\n\nПрофессия: {profession['title']}\nРезультат: {session['score']}/{TEST_SIZE}"
+    )
+
+    if certificate_sent:
+        final_text += "\n\n📄 Именной PDF-сертификат уже отправлен вам в этот чат."
+    else:
+        final_text += "\n\n⚠️ Результат сохранён, но автоматически отправить сертификат не удалось. Проверьте доступность шаблона PDF по ссылке и попробуйте позже."
+
     await update.message.reply_text(
-        FINAL_THANKS_TEXT + f"\n\nПрофессия: {profession['title']}\nРезультат: {session['score']}/{TEST_SIZE}",
+        final_text,
         reply_markup=get_after_finish_keyboard()
     )
 
@@ -2107,49 +2021,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def handle_send_certificate(query, request_id, context):
-    row = get_certificate_request(request_id)
-    if not row:
-        await query.answer("Заявка на сертификат не найдена.", show_alert=True)
-        return
-
-    if row["status"] == "sent":
-        await query.answer("Сертификат уже отправлен пользователю.", show_alert=False)
-        await query.message.edit_reply_markup(reply_markup=get_admin_certificate_keyboard(request_id, is_sent=True))
-        return
-
-    pdf_path = Path(row["pdf_path"])
-    if not pdf_path.exists():
-        await query.answer("Файл сертификата не найден на сервере.", show_alert=True)
-        return
-
-    try:
-        with open(pdf_path, "rb") as pdf_file:
-            await context.bot.send_document(
-                chat_id=row["user_id"],
-                document=pdf_file,
-                filename=pdf_path.name,
-                caption=(
-                    "🏆 Your Verified Certificate of Completion\n\n"
-                    f"Course: {row['certificate_title'].title()}\n"
-                    f"Date Issued: {row['issue_date']}"
-                ),
-            )
-    except Exception as e:
-        await query.answer(f"Не удалось отправить сертификат: {e}", show_alert=True)
-        return
-
-    mark_certificate_sent(request_id)
-    save_action(query.from_user, f"Отправил сертификат пользователю {row['user_id']} | request_id={request_id}")
-
-    try:
-        await query.message.edit_reply_markup(reply_markup=get_admin_certificate_keyboard(request_id, is_sent=True))
-    except Exception:
-        pass
-
-    await query.answer("Сертификат отправлен пользователю.", show_alert=False)
-
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2184,15 +2055,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_answer(query, int(question_index), int(selected_index), context)
         return
 
-    if data.startswith("send_certificate:"):
-        _, request_id = data.split(":")
-        await handle_send_certificate(query, int(request_id), context)
-        return
-
-    if data.startswith("sent_certificate:"):
-        await query.answer("Сертификат уже отправлен.", show_alert=False)
-        return
-
 
 def main():
     init_db()
@@ -2204,7 +2066,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    print("2026UP universal exam bot with certificate review started...")
+    print("2026UP universal exam bot started...")
     app.run_polling()
 
 

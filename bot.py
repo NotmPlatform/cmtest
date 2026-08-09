@@ -137,6 +137,8 @@ ACCESS_GRANTED_TEXT = """
 
 Сейчас вам будет выдано 15 случайных вопросов из банка по выбранной специализации.
 Выберите один правильный ответ на каждый вопрос.
+Если первый ответ неверный, бот сразу сообщит об этом и предложит попробовать ещё раз.
+Итоговый балл считается по первой попытке на каждый вопрос.
 """.strip()
 
 ACCESS_DENIED_TEXT = """
@@ -2401,10 +2403,28 @@ async def handle_answer(query, question_index, selected_index, context):
 
     question = get_question(session, question_index)
     answers = list(session["answers"])
-    answers.append(selected_index)
-
     score = session["score"]
-    if selected_index == question["correct"]:
+
+    # answers содержит первый выбранный вариант для каждого вопроса. Если его
+    # длина уже больше current_index, пользователь повторно отвечает после ошибки.
+    is_first_attempt = len(answers) == question_index
+    is_correct = selected_index == question["correct"]
+
+    if not is_correct:
+        if is_first_attempt:
+            answers.append(selected_index)
+            update_session_from_user(
+                query.from_user,
+                answers=answers,
+            )
+
+        await query.answer("❌ Неверно. Попробуйте ещё раз.", show_alert=True)
+        return
+
+    await query.answer("✅ Правильно!", show_alert=False)
+
+    if is_first_attempt:
+        answers.append(selected_index)
         score += 1
 
     next_index = question_index + 1
@@ -2451,21 +2471,20 @@ async def handle_go_back(query):
         await query.answer("Назад вернуться нельзя.", show_alert=False)
         return
 
+    if len(session["answers"]) > session["current_index"]:
+        await query.answer(
+            "Сначала выберите правильный ответ на текущий вопрос.",
+            show_alert=False,
+        )
+        return
+
+    await query.answer()
+
     previous_index = session["current_index"] - 1
-    previous_question = get_question(session, previous_index)
-
-    answers = list(session["answers"])
-    last_selected = answers.pop()
-
-    score = session["score"]
-    if last_selected == previous_question["correct"]:
-        score -= 1
 
     update_session_from_user(
         query.from_user,
         current_index=previous_index,
-        answers=answers,
-        score=score,
     )
 
     new_session = get_session(query.from_user.id)
@@ -2584,31 +2603,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
 
-    if data == "restart_test":
-        delete_session(query.from_user.id)
-        save_action(query.from_user, "Нажал кнопку: Начать заново")
-        await safe_edit_message(query.message, WELCOME_TEXT, reply_markup=get_profession_keyboard())
-        return
-
-    if data == "resume_flow":
-        await handle_resume_flow(query)
-        return
-
+    # Эти обработчики сами отвечают на callback, поскольку показывают
+    # пользователю результат ответа или контекстное уведомление.
     if data == "go_back":
         await handle_go_back(query)
         return
 
-    if data.startswith("choose_profession:"):
-        _, profession_key = data.split(":")
-        await handle_choose_profession(query, profession_key)
-        return
-
-    if data.startswith("check_access:"):
-        _, profession_key = data.split(":")
-        await handle_check_access(query, context, profession_key)
+    if data.startswith("answer:"):
+        _, question_index, selected_index = data.split(":")
+        await handle_answer(query, int(question_index), int(selected_index), context)
         return
 
     if data.startswith("send_certificate:"):
@@ -2631,9 +2636,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if data.startswith("answer:"):
-        _, question_index, selected_index = data.split(":")
-        await handle_answer(query, int(question_index), int(selected_index), context)
+    await query.answer()
+
+    if data == "restart_test":
+        delete_session(query.from_user.id)
+        save_action(query.from_user, "Нажал кнопку: Начать заново")
+        await safe_edit_message(query.message, WELCOME_TEXT, reply_markup=get_profession_keyboard())
+        return
+
+    if data == "resume_flow":
+        await handle_resume_flow(query)
+        return
+
+    if data.startswith("choose_profession:"):
+        _, profession_key = data.split(":")
+        await handle_choose_profession(query, profession_key)
+        return
+
+    if data.startswith("check_access:"):
+        _, profession_key = data.split(":")
+        await handle_check_access(query, context, profession_key)
         return
 
 
